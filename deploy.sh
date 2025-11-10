@@ -40,16 +40,21 @@ gcloud config set project $PROJECT_ID
 echo "Which services do you want to deploy?"
 echo "1) Backend API only"
 echo "2) GPU Service only"
-echo "3) Both services"
-read -p "Select (1-3): " choice
+echo "3) Ghidra Service only (NEW!)"
+echo "4) Backend + GPU"
+echo "5) All services (Backend + GPU + Ghidra)"
+read -p "Select (1-5): " choice
 
 deploy_backend=false
 deploy_gpu=false
+deploy_ghidra=false
 
 case $choice in
     1) deploy_backend=true ;;
     2) deploy_gpu=true ;;
-    3) deploy_backend=true; deploy_gpu=true ;;
+    3) deploy_ghidra=true ;;
+    4) deploy_backend=true; deploy_gpu=true ;;
+    5) deploy_backend=true; deploy_gpu=true; deploy_ghidra=true ;;
     *) echo "Invalid choice"; exit 1 ;;
 esac
 
@@ -76,16 +81,13 @@ if [ "$deploy_backend" = true ]; then
         --timeout 300 \
         --max-instances 10 \
         --allow-unauthenticated \
-        --set-env-vars="PROJECT_ID=${PROJECT_ID},STORAGE_BUCKET=${STORAGE_BUCKET},RESULTS_BUCKET=${RESULTS_BUCKET},GPU_SERVICE_URL=${GPU_SERVICE_URL}"
+        --set-env-vars="PROJECT_ID=${PROJECT_ID},STORAGE_BUCKET=${STORAGE_BUCKET},GPU_SERVICE_URL=${GPU_SERVICE_URL},GHIDRA_SERVICE_URL=${GHIDRA_SERVICE_URL}"
 
     # Get service URL
     BACKEND_URL=$(gcloud run services describe backend-api --region=${REGION} --format='value(status.url)')
     echo ""
-    echo "✅ Backend API deployed successfully!"
+    echo "✅ Backend API deployed!"
     echo "   URL: $BACKEND_URL"
-    echo ""
-    echo "⚠️  Update .env file with:"
-    echo "   BACKEND_SERVICE_URL=$BACKEND_URL"
 
     cd ..
 fi
@@ -96,23 +98,20 @@ if [ "$deploy_gpu" = true ]; then
     echo "🚀 Deploying GPU Analysis Service..."
     echo "====================================="
 
-    # Check if GPU quota is available
+    # Check GPU quota
     read -p "Have you received GPU quota approval? (y/n): " gpu_approved
 
     if [ "$gpu_approved" != "y" ]; then
-        echo "⚠️  Warning: You need GPU quota approval first!"
+        echo "⚠️  Warning: GPU quota needed!"
         echo "   Visit: https://run.devpost.com/resources"
-        echo ""
-        read -p "Deploy without GPU (CPU-only, slower)? (y/n): " use_cpu
-
+        read -p "Deploy CPU-only? (y/n): " use_cpu
         if [ "$use_cpu" != "y" ]; then
-            echo "Skipping GPU service deployment."
-            exit 0
+            echo "Skipping GPU service."
+        else
+            GPU_FLAG=""
+            GPU_TYPE_FLAG=""
+            MEMORY="16Gi"
         fi
-
-        GPU_FLAG=""
-        GPU_TYPE_FLAG=""
-        MEMORY="16Gi"
     else
         GPU_FLAG="--gpu 1"
         GPU_TYPE_FLAG="--gpu-type nvidia-l4"
@@ -121,18 +120,10 @@ if [ "$deploy_gpu" = true ]; then
 
     cd gpu-service
 
-    # Copy required modules
-    echo "Preparing deployment package..."
-    cp -r ../analyzer ./ 2>/dev/null || true
-    cp -r ../integrations ./ 2>/dev/null || true
-    cp ../service-account-key.json ./ 2>/dev/null || true
-
-    # Build container
-    echo "Building GPU service container (this may take 5-10 minutes)..."
+    echo "Building GPU service..."
     gcloud builds submit --tag gcr.io/${PROJECT_ID}/gpu-analyzer --timeout=20m
 
-    # Deploy to Cloud Run with GPU
-    echo "Deploying to Cloud Run with GPU..."
+    echo "Deploying to Cloud Run..."
     gcloud run deploy gpu-analyzer \
         --image gcr.io/${PROJECT_ID}/gpu-analyzer \
         --platform managed \
@@ -143,21 +134,46 @@ if [ "$deploy_gpu" = true ]; then
         ${GPU_FLAG} \
         ${GPU_TYPE_FLAG} \
         --max-instances 3 \
-        --min-instances 0 \
         --allow-unauthenticated \
-        --set-env-vars="PROJECT_ID=${PROJECT_ID},STORAGE_BUCKET=${STORAGE_BUCKET},VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY},USE_GPU=true"
+        --set-env-vars="USE_GPU=true,GHIDRA_SERVICE_URL=${GHIDRA_SERVICE_URL}"
 
-    # Clean up copied files
-    rm -rf analyzer integrations service-account-key.json 2>/dev/null || true
-
-    # Get service URL
     GPU_URL=$(gcloud run services describe gpu-analyzer --region=${REGION} --format='value(status.url)')
     echo ""
-    echo "✅ GPU Service deployed successfully!"
+    echo "✅ GPU Service deployed!"
     echo "   URL: $GPU_URL"
+
+    cd ..
+fi
+
+# Deploy Ghidra Service (NEW!)
+if [ "$deploy_ghidra" = true ]; then
+    echo ""
+    echo "🚀 Deploying Ghidra Binary Analysis Service..."
+    echo "==============================================="
+
+    cd ghidra-service
+
+    echo "Building Ghidra service (this may take 10-15 minutes - Ghidra is 2GB+)..."
+    gcloud builds submit --tag gcr.io/${PROJECT_ID}/ghidra-service --timeout=30m
+
+    echo "Deploying to Cloud Run..."
+    gcloud run deploy ghidra-service \
+        --image gcr.io/${PROJECT_ID}/ghidra-service \
+        --platform managed \
+        --region ${REGION} \
+        --memory 8Gi \
+        --cpu 4 \
+        --timeout 300 \
+        --max-instances 5 \
+        --allow-unauthenticated
+
+    GHIDRA_URL=$(gcloud run services describe ghidra-service --region=${REGION} --format='value(status.url)')
+    echo ""
+    echo "✅ Ghidra Service deployed!"
+    echo "   URL: $GHIDRA_URL"
     echo ""
     echo "⚠️  Update .env file with:"
-    echo "   GPU_SERVICE_URL=$GPU_URL"
+    echo "   GHIDRA_SERVICE_URL=$GHIDRA_URL"
 
     cd ..
 fi
@@ -166,15 +182,15 @@ echo ""
 echo "🎉 Deployment Complete!"
 echo "======================="
 echo ""
-echo "📝 Next Steps:"
-echo "   1. Update .env file with service URLs shown above"
-echo "   2. Test the API:"
-if [ "$deploy_backend" = true ]; then
-    echo "      curl ${BACKEND_URL}/health"
-fi
-if [ "$deploy_gpu" = true ]; then
-    echo "      curl ${GPU_URL}/health"
-fi
+echo "📝 Service URLs:"
+[ "$deploy_backend" = true ] && echo "   Backend:  $BACKEND_URL"
+[ "$deploy_gpu" = true ] && echo "   GPU:      $GPU_URL"
+[ "$deploy_ghidra" = true ] && echo "   Ghidra:   $GHIDRA_URL"
 echo ""
-echo "   3. Try uploading a test file through the API"
+echo "📝 Next Steps:"
+echo "   1. Update .env with service URLs"
+echo "   2. Test endpoints:"
+[ "$deploy_backend" = true ] && echo "      curl $BACKEND_URL/health"
+[ "$deploy_gpu" = true ] && echo "      curl $GPU_URL/health"
+[ "$deploy_ghidra" = true ] && echo "      curl $GHIDRA_URL/health"
 echo ""
