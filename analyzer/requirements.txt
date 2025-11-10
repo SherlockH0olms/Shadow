@@ -1,0 +1,5 @@
+# Pattern detection
+numpy==1.24.3
+
+# YARA scanning
+yara-python==4.3.1
